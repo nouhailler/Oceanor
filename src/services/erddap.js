@@ -1,17 +1,27 @@
 /**
  * ERDDAP Service for NOAA OISST v2.1 Data
- * Dataset: ncdcOisst21Agg
+ * Now using backend proxy to avoid CORS issues
  */
 
-const BASE_URL = 'https://coastwatch.pfeg.noaa.gov/erddap/griddap/ncdcOisst21Agg.json';
+// Backend API base URL - will be configured based on environment
+let BACKEND_BASE_URL;
 
-// CORS Proxy options - try multiple proxies as fallback
-const CORS_PROXIES = [
-  'https://corsproxy.io/?',
-  'https://api.allorigins.win/raw?url=',
-  'https://thingproxy.freeboard.io/fetch/',
-  'https://cors-anywhere.herokuapp.com/'
-];
+// Determine backend URL based on environment
+if (typeof window !== 'undefined') {
+  // Browser environment
+  if (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1') {
+    BACKEND_BASE_URL = 'http://localhost:3001';
+  } else if (window.location.hostname.includes('github.io')) {
+    // For GitHub Pages deployment, use a deployed backend
+    // You'll need to deploy the backend separately and update this URL
+    BACKEND_BASE_URL = 'https://oceanor-backend.onrender.com';
+  } else {
+    BACKEND_BASE_URL = ''; // Will use relative paths
+  }
+} else {
+  // Server-side environment
+  BACKEND_BASE_URL = process.env.BACKEND_URL || 'http://localhost:3001';
+}
 
 // Predefined geographic zones
 const ZONES = {
@@ -51,186 +61,89 @@ const TIME_RANGES = {
 };
 
 /**
- * Build ERDDAP query URL
- * @param {string} variable - 'sst' or 'anom'
- * @param {Object} zone - { lat: [min, max], lon: [min, max] }
- * @param {Date} startDate - Start date
- * @param {Date} endDate - End date
- * @returns {string} ERDDAP query URL
+ * Build API URL for backend
+ * @param {string} endpoint - API endpoint
+ * @param {Object} params - Query parameters
+ * @returns {string} Full API URL
  */
-function buildQueryUrl(variable, zone, startDate, endDate) {
-  // Format date for ERDDAP: YYYY-MM-DDTHH:MM:SSZ
-  const formatDate = (date) => {
-    const year = date.getUTCFullYear();
-    const month = String(date.getUTCMonth() + 1).padStart(2, '0');
-    const day = String(date.getUTCDate()).padStart(2, '0');
-    return `${year}-${month}-${day}T00:00:00Z`;
-  };
+function buildApiUrl(endpoint, params = {}) {
+  const base = BACKEND_BASE_URL || '';
+  const queryString = Object.entries(params)
+    .filter(([_, value]) => value !== undefined && value !== null)
+    .map(([key, value]) => `${encodeURIComponent(key)}=${encodeURIComponent(value)}`)
+    .join('&');
   
-  const timeStart = formatDate(startDate);
-  const timeEnd = formatDate(endDate);
-  
-  // ERDDAP constraint syntax: [start:stride:end]
-  // Note: ERDDAP expects parentheses around date values
-  const timeConstraint = `[(${timeStart}):1:(${timeEnd})]`;
-  const latConstraint = `[(${zone.lat[0]}):1:(${zone.lat[1]})]`;
-  const lonConstraint = `[(${zone.lon[0]}):1:(${zone.lon[1]})]`;
-  
-  // ERDDAP uses [time][altitude][latitude][longitude]
-  // Altitude is fixed at 0.0 for surface data
-  return `${BASE_URL}?${variable}${timeConstraint}[(0.0)]${latConstraint}${lonConstraint}`;
+  return `${base}/api/${endpoint}${queryString ? '?' + queryString : ''}`;
 }
 
 /**
- * Try fetching through available proxies
- * @param {string} url - URL to fetch
- * @param {number} proxyIndex - Current proxy index
- * @returns {Promise<Response>}
- */
-async function tryProxyFetch(url, proxyIndex = 0) {
-  if (proxyIndex >= CORS_PROXIES.length) {
-    throw new Error('All CORS proxies failed');
-  }
-  
-  const proxy = CORS_PROXIES[proxyIndex];
-  const proxyUrl = proxy + encodeURIComponent(url);
-  
-  try {
-    const response = await fetch(proxyUrl, {
-      method: 'GET',
-      headers: {
-        'Accept': 'application/json'
-      }
-    });
-    
-    if (response.ok) {
-      return response;
-    }
-    
-    // Try next proxy
-    return tryProxyFetch(url, proxyIndex + 1);
-  } catch (error) {
-    console.warn(`Proxy ${proxy} failed, trying next...`);
-    return tryProxyFetch(url, proxyIndex + 1);
-  }
-}
-
-/**
- * Fetch data from ERDDAP with multiple fallback options
- * @param {string} url - ERDDAP query URL
+ * Fetch data from backend API
+ * @param {string} url - API URL
  * @returns {Promise<Object>} - Parsed JSON response
  */
-async function fetchErddapData(url) {
+async function fetchFromBackend(url) {
   try {
-    // Try direct fetch with extended timeout
-    console.log('Trying direct fetch to ERDDAP...');
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 60000); // 60 seconds
-    
     const response = await fetch(url, {
-      signal: controller.signal,
-      mode: 'cors',
+      method: 'GET',
       headers: {
-        'Accept': 'application/json'
+        'Accept': 'application/json',
+        'Content-Type': 'application/json'
       }
     });
     
-    clearTimeout(timeoutId);
-    
-    if (response.ok) {
-      const data = await response.json();
-      if (!data || !data.table) {
-        throw new Error('Invalid ERDDAP response format');
+    if (!response.ok) {
+      const errorText = await response.text();
+      let errorMsg = `Backend request failed: ${response.status} ${response.statusText}`;
+      if (errorText) {
+        try {
+          const errorData = JSON.parse(errorText);
+          errorMsg += `\n${errorData.error || errorText}`;
+        } catch (e) {
+          errorMsg += `\n${errorText}`;
+        }
       }
-      return data;
+      throw new Error(errorMsg);
     }
     
-    // Direct fetch failed, try proxies
-    console.log('Direct fetch failed, trying CORS proxies...');
-    const proxyResponse = await tryProxyFetch(url);
-    const data = await proxyResponse.json();
-    
-    if (!data || !data.table) {
-      throw new Error('Invalid ERDDAP response format from proxy');
-    }
-    return data;
-    
+    return await response.json();
   } catch (error) {
-    console.error('All fetch attempts failed:', error);
+    console.error('Error fetching from backend:', error);
     
-    // Create user-friendly error message
-    const errorMsg = `Failed to fetch data from ERDDAP.\n\n` +
-      `This may be due to:\n` +
-      `- Network restrictions (CORS policy)\n` +
-      `- ERDDAP server temporary unavailability\n` +
-      `- Internet connection issues\n\n` +
-      `You can test connectivity by opening this URL directly in your browser:\n` +
-      `${url}\n\n` +
-      `If the URL works in your browser but not in the app, it's a CORS issue that requires a server-side proxy.`;
+    // Provide helpful error message
+    const errorMsg = `Failed to connect to backend server.\n\n` +
+      `This may be because:\n` +
+      `- The backend server is not running\n` +
+      `- You're using the GitHub Pages version without a deployed backend\n\n` +
+      `To fix this:\n` +
+      `1. Run the backend locally: npm run start (in /server folder)\n` +
+      `2. Or deploy the backend to a hosting service\n` +
+      `3. Update the BACKEND_BASE_URL in erddap.js`;
     
     throw new Error(errorMsg);
   }
 }
 
 /**
- * Parse ERDDAP response and aggregate spatially
- * @param {Object} erddapData - Raw ERDDAP JSON response
- * @returns {Array<{date: Date, value: number}>} - Time series with aggregated values
+ * Parse API response to match expected format
+ * @param {Object} apiResponse - Backend API response
+ * @returns {Array<{date: Date, value: number}>}
  */
-function parseAndAggregate(erddapData) {
-  if (!erddapData?.table) {
-    throw new Error('Invalid ERDDAP response format');
+function parseApiResponse(apiResponse) {
+  if (!apiResponse || !apiResponse.success) {
+    throw new Error(apiResponse?.error || 'Invalid API response');
   }
-
-  const { rows, columnNames } = erddapData.table;
   
-  if (!rows || rows.length === 0) {
-    console.warn('No data rows returned from ERDDAP');
+  const { data } = apiResponse;
+  
+  if (!data || !Array.isArray(data)) {
     return [];
   }
-
-  // Find column indices
-  const timeIndex = columnNames.indexOf('time');
-  const valueIndex = columnNames.findIndex(col => col.includes('sst') || col.includes('anom'));
-  const latIndex = columnNames.indexOf('latitude');
-  const lonIndex = columnNames.indexOf('longitude');
-
-  if (timeIndex === -1 || valueIndex === -1) {
-    console.error('Required columns not found. Available columns:', columnNames);
-    throw new Error('Required columns (time, sst/anom) not found in ERDDAP response');
-  }
-
-  // Group by time and aggregate spatially
-  const timeMap = new Map();
   
-  for (const row of rows) {
-    const date = new Date(row[timeIndex]);
-    const value = row[valueIndex];
-    
-    if (value === null || value === undefined || isNaN(value)) continue;
-    
-    const dateKey = date.toISOString().split('T')[0];
-    
-    if (!timeMap.has(dateKey)) {
-      timeMap.set(dateKey, { date, values: [], count: 0 });
-    }
-    
-    timeMap.get(dateKey).values.push(value);
-    timeMap.get(dateKey).count++;
-  }
-
-  // Calculate spatial average for each time point
-  const result = [];
-  for (const [dateKey, data] of timeMap) {
-    const sum = data.values.reduce((acc, val) => acc + val, 0);
-    const avg = sum / data.values.length;
-    result.push({ date: data.date, value: avg });
-  }
-
-  // Sort by date
-  result.sort((a, b) => a.date - b.date);
-  
-  return result;
+  // Convert date strings back to Date objects
+  return data.map(item => ({
+    date: new Date(item.date),
+    value: item.value
+  }));
 }
 
 /**
@@ -242,32 +155,18 @@ function parseAndAggregate(erddapData) {
  * @returns {Promise<Array<{date: Date, value: number}>>}
  */
 export async function fetchTimeSeries(variable, zoneId, timeRange, endDate = new Date()) {
-  const zone = ZONES[zoneId];
-  if (!zone) {
-    throw new Error(`Unknown zone: ${zoneId}`);
-  }
-
-  const days = TIME_RANGES[timeRange];
-  const startDate = new Date(endDate);
+  const params = {
+    variable,
+    zoneId,
+    timeRange,
+    endDate: endDate.toISOString()
+  };
   
-  if (days) {
-    startDate.setDate(startDate.getDate() - days);
-  } else {
-    // All available data: start from 1981-09-01 (OISST v2.1 start)
-    startDate.setUTCFullYear(1981, 8, 1);
-  }
-
-  // Validate date range
-  if (startDate > endDate) {
-    throw new Error('Start date is after end date');
-  }
-
-  const url = buildQueryUrl(variable, zone, startDate, endDate);
-  console.log('ERDDAP URL:', url);
+  const url = buildApiUrl('data', params);
+  console.log('Fetching from backend:', url);
   
-  const erddapData = await fetchErddapData(url);
-  
-  return parseAndAggregate(erddapData);
+  const apiResponse = await fetchFromBackend(url);
+  return parseApiResponse(apiResponse);
 }
 
 /**
@@ -279,12 +178,25 @@ export async function fetchTimeSeries(variable, zoneId, timeRange, endDate = new
  */
 export async function fetchComparativeData(zoneId, timeRange, endDate = new Date()) {
   try {
-    const [sstData, anomData] = await Promise.all([
-      fetchTimeSeries('sst', zoneId, timeRange, endDate),
-      fetchTimeSeries('anom', zoneId, timeRange, endDate)
-    ]);
+    const params = {
+      zoneId,
+      timeRange,
+      endDate: endDate.toISOString()
+    };
     
-    return { sst: sstData, anom: anomData };
+    const url = buildApiUrl('comparative', params);
+    console.log('Fetching comparative data from backend:', url);
+    
+    const apiResponse = await fetchFromBackend(url);
+    
+    if (!apiResponse || !apiResponse.success) {
+      throw new Error(apiResponse?.error || 'Failed to fetch comparative data');
+    }
+    
+    return {
+      sst: parseApiResponse({ data: apiResponse.sst, success: true }),
+      anom: parseApiResponse({ data: apiResponse.anom, success: true })
+    };
   } catch (error) {
     console.error('Error fetching comparative data:', error);
     throw error;
@@ -319,10 +231,28 @@ export function getBaselineInfo() {
   };
 }
 
+/**
+ * Set backend URL (for testing or dynamic configuration)
+ * @param {string} url - Backend base URL
+ */
+export function setBackendUrl(url) {
+  BACKEND_BASE_URL = url;
+}
+
+/**
+ * Get current backend URL
+ * @returns {string}
+ */
+export function getBackendUrl() {
+  return BACKEND_BASE_URL;
+}
+
 export default {
   fetchTimeSeries,
   fetchComparativeData,
   getZones,
   getTimeRanges,
-  getBaselineInfo
+  getBaselineInfo,
+  setBackendUrl,
+  getBackendUrl
 };
