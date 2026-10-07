@@ -5,8 +5,13 @@
 
 const BASE_URL = 'https://coastwatch.pfeg.noaa.gov/erddap/griddap/ncdcOisst21Agg.json';
 
-// CORS Proxy fallback (if direct access fails)
-const CORS_PROXY = 'https://api.allorigins.win/raw?url=';
+// CORS Proxy options - try multiple proxies as fallback
+const CORS_PROXIES = [
+  'https://corsproxy.io/?',
+  'https://api.allorigins.win/raw?url=',
+  'https://thingproxy.freeboard.io/fetch/',
+  'https://cors-anywhere.herokuapp.com/'
+];
 
 // Predefined geographic zones
 const ZONES = {
@@ -77,81 +82,93 @@ function buildQueryUrl(variable, zone, startDate, endDate) {
 }
 
 /**
- * Fetch data from ERDDAP with fallback to CORS proxy
+ * Try fetching through available proxies
+ * @param {string} url - URL to fetch
+ * @param {number} proxyIndex - Current proxy index
+ * @returns {Promise<Response>}
+ */
+async function tryProxyFetch(url, proxyIndex = 0) {
+  if (proxyIndex >= CORS_PROXIES.length) {
+    throw new Error('All CORS proxies failed');
+  }
+  
+  const proxy = CORS_PROXIES[proxyIndex];
+  const proxyUrl = proxy + encodeURIComponent(url);
+  
+  try {
+    const response = await fetch(proxyUrl, {
+      method: 'GET',
+      headers: {
+        'Accept': 'application/json'
+      }
+    });
+    
+    if (response.ok) {
+      return response;
+    }
+    
+    // Try next proxy
+    return tryProxyFetch(url, proxyIndex + 1);
+  } catch (error) {
+    console.warn(`Proxy ${proxy} failed, trying next...`);
+    return tryProxyFetch(url, proxyIndex + 1);
+  }
+}
+
+/**
+ * Fetch data from ERDDAP with multiple fallback options
  * @param {string} url - ERDDAP query URL
  * @returns {Promise<Object>} - Parsed JSON response
  */
 async function fetchErddapData(url) {
-  const fetchOptions = {
-    method: 'GET',
-    mode: 'cors',
-    credentials: 'omit',
-    headers: {
-      'Accept': 'application/json',
-      'Content-Type': 'application/json'
-    }
-  };
-  
   try {
-    // Try direct fetch first
-    console.log('Fetching from ERDDAP directly:', url);
-    const response = await fetch(url, fetchOptions);
+    // Try direct fetch with extended timeout
+    console.log('Trying direct fetch to ERDDAP...');
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 60000); // 60 seconds
     
-    if (!response.ok) {
-      const errorText = await response.text();
-      console.warn('Direct ERDDAP request failed, trying CORS proxy...');
-      
-      // Fallback to CORS proxy
-      const proxyUrl = `${CORS_PROXY}${encodeURIComponent(url)}`;
-      const proxyResponse = await fetch(proxyUrl, fetchOptions);
-      
-      if (!proxyResponse.ok) {
-        const proxyError = await proxyResponse.text();
-        throw new Error(`ERDDAP request failed: ${response.status} ${response.statusText}\nProxy error: ${proxyError}`);
+    const response = await fetch(url, {
+      signal: controller.signal,
+      mode: 'cors',
+      headers: {
+        'Accept': 'application/json'
       }
-      
-      const data = await proxyResponse.json();
+    });
+    
+    clearTimeout(timeoutId);
+    
+    if (response.ok) {
+      const data = await response.json();
       if (!data || !data.table) {
-        throw new Error('Invalid ERDDAP response format from proxy');
+        throw new Error('Invalid ERDDAP response format');
       }
       return data;
     }
     
-    const data = await response.json();
+    // Direct fetch failed, try proxies
+    console.log('Direct fetch failed, trying CORS proxies...');
+    const proxyResponse = await tryProxyFetch(url);
+    const data = await proxyResponse.json();
     
-    // Check if response has the expected structure
     if (!data || !data.table) {
-      throw new Error('Invalid ERDDAP response format');
+      throw new Error('Invalid ERDDAP response format from proxy');
     }
-    
     return data;
+    
   } catch (error) {
-    console.error('Error fetching ERDDAP data:', error);
+    console.error('All fetch attempts failed:', error);
     
-    // If it's a CORS or network error, try the proxy
-    if (error.name === 'TypeError' || error.message.includes('Failed to fetch') || error.message.includes('aborted')) {
-      try {
-        console.log('Trying CORS proxy as fallback...');
-        const proxyUrl = `${CORS_PROXY}${encodeURIComponent(url)}`;
-        const proxyResponse = await fetch(proxyUrl, fetchOptions);
-        
-        if (!proxyResponse.ok) {
-          const proxyError = await proxyResponse.text();
-          throw new Error(`CORS Proxy failed: ${proxyResponse.status} - ${proxyError}`);
-        }
-        
-        const data = await proxyResponse.json();
-        if (!data || !data.table) {
-          throw new Error('Invalid ERDDAP response format from proxy');
-        }
-        return data;
-      } catch (proxyError) {
-        console.error('CORS Proxy also failed:', proxyError);
-        throw new Error(`Failed to fetch data from ERDDAP. Please check your internet connection.\nDirect URL: ${url}\n\nYou can also try opening this URL directly in your browser to test connectivity.`);
-      }
-    }
+    // Create user-friendly error message
+    const errorMsg = `Failed to fetch data from ERDDAP.\n\n` +
+      `This may be due to:\n` +
+      `- Network restrictions (CORS policy)\n` +
+      `- ERDDAP server temporary unavailability\n` +
+      `- Internet connection issues\n\n` +
+      `You can test connectivity by opening this URL directly in your browser:\n` +
+      `${url}\n\n` +
+      `If the URL works in your browser but not in the app, it's a CORS issue that requires a server-side proxy.`;
     
-    throw new Error(`Failed to fetch data from ERDDAP: ${error.message}`);
+    throw new Error(errorMsg);
   }
 }
 
