@@ -51,11 +51,22 @@ const TIME_RANGES = {
  * @returns {string} ERDDAP query URL
  */
 function buildQueryUrl(variable, zone, startDate, endDate) {
-  const formatDate = (date) => date.toISOString().split('T')[0] + 'T00:00:00Z';
+  // Format date for ERDDAP: YYYY-MM-DDTHH:MM:SSZ
+  const formatDate = (date) => {
+    const year = date.getUTCFullYear();
+    const month = String(date.getUTCMonth() + 1).padStart(2, '0');
+    const day = String(date.getUTCDate()).padStart(2, '0');
+    return `${year}-${month}-${day}T00:00:00Z`;
+  };
   
-  const timeConstraint = `[${formatDate(startDate)}:1:${formatDate(endDate)}]`;
-  const latConstraint = `[${zone.lat[0]}:1:${zone.lat[1]}]`;
-  const lonConstraint = `[${zone.lon[0]}:1:${zone.lon[1]}]`;
+  const timeStart = formatDate(startDate);
+  const timeEnd = formatDate(endDate);
+  
+  // ERDDAP constraint syntax: [start:stride:end]
+  // Note: ERDDAP expects parentheses around date values
+  const timeConstraint = `[(${timeStart}):1:(${timeEnd})]`;
+  const latConstraint = `[(${zone.lat[0]}):1:(${zone.lat[1]})]`;
+  const lonConstraint = `[(${zone.lon[0]}):1:(${zone.lon[1]})]`;
   
   // ERDDAP uses [time][altitude][latitude][longitude]
   // Altitude is fixed at 0.0 for surface data
@@ -63,22 +74,41 @@ function buildQueryUrl(variable, zone, startDate, endDate) {
 }
 
 /**
- * Fetch data from ERDDAP
+ * Fetch data from ERDDAP with timeout and error handling
  * @param {string} url - ERDDAP query URL
  * @returns {Promise<Object>} - Parsed JSON response
  */
 async function fetchErddapData(url) {
   try {
-    const response = await fetch(url);
+    // Add timeout to fetch request
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 30000); // 30 seconds timeout
+    
+    const response = await fetch(url, {
+      signal: controller.signal,
+      headers: {
+        'Accept': 'application/json'
+      }
+    });
+    
+    clearTimeout(timeoutId);
     
     if (!response.ok) {
-      throw new Error(`ERDDAP request failed: ${response.status} ${response.statusText}`);
+      const errorText = await response.text();
+      throw new Error(`ERDDAP request failed: ${response.status} ${response.statusText}\n${errorText}`);
     }
     
-    return await response.json();
+    const data = await response.json();
+    
+    // Check if response has the expected structure
+    if (!data || !data.table) {
+      throw new Error('Invalid ERDDAP response format');
+    }
+    
+    return data;
   } catch (error) {
     console.error('Error fetching ERDDAP data:', error);
-    throw error;
+    throw new Error(`Failed to fetch data from ERDDAP: ${error.message}`);
   }
 }
 
@@ -95,6 +125,7 @@ function parseAndAggregate(erddapData) {
   const { rows, columnNames } = erddapData.table;
   
   if (!rows || rows.length === 0) {
+    console.warn('No data rows returned from ERDDAP');
     return [];
   }
 
@@ -105,7 +136,8 @@ function parseAndAggregate(erddapData) {
   const lonIndex = columnNames.indexOf('longitude');
 
   if (timeIndex === -1 || valueIndex === -1) {
-    throw new Error('Required columns not found in ERDDAP response');
+    console.error('Required columns not found. Available columns:', columnNames);
+    throw new Error('Required columns (time, sst/anom) not found in ERDDAP response');
   }
 
   // Group by time and aggregate spatially
@@ -115,7 +147,7 @@ function parseAndAggregate(erddapData) {
     const date = new Date(row[timeIndex]);
     const value = row[valueIndex];
     
-    if (value === null || value === undefined) continue;
+    if (value === null || value === undefined || isNaN(value)) continue;
     
     const dateKey = date.toISOString().split('T')[0];
     
@@ -162,10 +194,17 @@ export async function fetchTimeSeries(variable, zoneId, timeRange, endDate = new
     startDate.setDate(startDate.getDate() - days);
   } else {
     // All available data: start from 1981-09-01 (OISST v2.1 start)
-    startDate.setFullYear(1981, 8, 1);
+    startDate.setUTCFullYear(1981, 8, 1);
+  }
+
+  // Validate date range
+  if (startDate > endDate) {
+    throw new Error('Start date is after end date');
   }
 
   const url = buildQueryUrl(variable, zone, startDate, endDate);
+  console.log('ERDDAP URL:', url); // Debug logging
+  
   const erddapData = await fetchErddapData(url);
   
   return parseAndAggregate(erddapData);
