@@ -1,0 +1,26 @@
+{
+  "name": "NOAA SST Dashboard",
+  "short_name": "SST Dashboard",
+  "description": "Tableau de bord PWA pour visualiser l'évolution des températures océaniques NOAA OISST v2.1 avec support hors-ligne",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0f0f1a",
+  "theme_color": "#1a1a2e",
+  "icons": [
+    {
+      "src": "/pwa-192x192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "/pwa-512x512.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    }
+  ],
+  "orientation": "portrait",
+  "scope": "/",
+  "lang": "fr",
+  "dir": "ltr"
+}
